@@ -2,12 +2,13 @@ from django import forms
 from django.contrib import admin
 from django.contrib.admin.helpers import ActionForm
 from django.contrib.auth.models import User
-from django.db.models import OuterRef, Exists
+from django.db import transaction
+from django.db.models import Exists, OuterRef
 from django.utils.translation import gettext_lazy as _
 
 from .models import (
-    Author,
     AuditCommand,
+    Author,
     CodeArchiveUrl,
     Container,
     ModelDocumentation,
@@ -18,6 +19,7 @@ from .models import (
     SuggestedMerge,
     Tag,
 )
+from .signals import notify_publications_changed
 
 
 class PublicationStatusListFilter(admin.SimpleListFilter):
@@ -46,15 +48,19 @@ class PublicationStatusListFilter(admin.SimpleListFilter):
 
 def assign_curator(modeladmin, request, queryset):
     assigned_curator_id = request.POST["assigned_curator_id"]
+    publication_ids = list(queryset.values_list("pk", flat=True))
+    audit_command = AuditCommand(
+        creator=request.user,
+        action=AuditCommand.Action.MANUAL,
+    )
 
-    user = request.user
-    audit_command = AuditCommand(creator=user, action=AuditCommand.Action.MANUAL)
-
-    # Does not seem to be a Haystack method to update records based on a queryset so records are updated one at a time
-    # to keep the Solr index in sync
-    for publication in queryset:
-        publication.log_update(
+    with transaction.atomic():
+        queryset.log_update(
             audit_command=audit_command, assigned_curator_id=assigned_curator_id
+        )
+        notify_publications_changed(
+            sender=Publication,
+            publication_ids=publication_ids,
         )
 
 

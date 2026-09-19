@@ -31,7 +31,9 @@ from .models import (
     CodeArchiveUrl,
     CodeArchiveUrlCategory,
     AuthorCorrespondenceLog,
+    SUGGESTED_MERGE_MODEL_NAMES,
 )
+from .signals import notify_publications_changed
 
 logger = logging.getLogger(__name__)
 
@@ -648,6 +650,11 @@ class PublicationSerializer(serializers.ModelSerializer):
                         "`create()` did not return an object instance."
                     )
 
+            notify_publications_changed(
+                sender=Publication,
+                publication_ids=(self.instance.pk,),
+            )
+
         return self.instance
 
     @property
@@ -785,7 +792,7 @@ class SuggestOtherMergeSerializer(serializers.Serializer):
 
 
 class SuggestMergeSerializer(serializers.Serializer):
-    model_name = serializers.CharField()
+    model_name = serializers.ChoiceField(choices=SUGGESTED_MERGE_MODEL_NAMES)
     instances = SuggestMergeInstanceSerializer(many=True)
     new_content = serializers.JSONField()
     email = serializers.EmailField(required=False, min_length=5)

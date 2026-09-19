@@ -1,6 +1,6 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 from django.core.management import call_command
 from django.test import TestCase
@@ -45,7 +45,8 @@ class CleanDataCommandTest(TestCase):
 
 
 class RemoveOrphansCommandTest(TestCase):
-    def test_handle_removes_unlinked_platforms_and_sponsors(self):
+    @patch("citation.management.commands.remove_orphans.notify_publications_changed")
+    def test_handle_removes_unlinked_platforms_and_sponsors(self, notify_changed):
         user = models.User.objects.create_user(
             username="owner", email="owner@example.com", password="test"
         )
@@ -70,3 +71,18 @@ class RemoveOrphansCommandTest(TestCase):
         self.assertFalse(models.Platform.objects.filter(pk=orphan_platform.pk).exists())
         self.assertTrue(models.Sponsor.objects.filter(pk=linked_sponsor.pk).exists())
         self.assertFalse(models.Sponsor.objects.filter(pk=orphan_sponsor.pk).exists())
+        self.assertEqual(
+            notify_changed.call_args_list,
+            [
+                call(
+                    sender=models.Platform,
+                    publication_ids=(),
+                    related_ids=(orphan_platform.pk,),
+                ),
+                call(
+                    sender=models.Sponsor,
+                    publication_ids=(),
+                    related_ids=(orphan_sponsor.pk,),
+                ),
+            ],
+        )

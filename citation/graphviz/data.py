@@ -2,19 +2,60 @@ import logging
 from collections import Counter
 from datetime import datetime
 
-from django.db.models import Max
-from haystack.query import SearchQuerySet
+from django.db.models import Count, Value
+from django.db.models.functions import Concat
 
+from ..models import CodeArchiveUrl, CodeArchiveUrlCategory, Publication
 from .globals import NetworkGroupByType
-from ..models import Publication, URLStatusLog
 
 logger = logging.getLogger(__name__)
 
 
-class NetworkData:
-    graph = {}
-    filter_value = {}
+def _year(value):
+    if hasattr(value, "year"):
+        return value.year
+    return datetime.fromisoformat(str(value)).year
 
+
+def filtered_publications(filter_criteria, require_year=False):
+    criteria = dict(filter_criteria or {})
+    start_value = criteria.pop("date_published__gte", None)
+    end_value = criteria.pop("date_published__lte", None)
+    author_name = criteria.pop("authors__name__exact", None)
+
+    publications = Publication.objects.filter(**criteria)
+    if author_name:
+        publications = publications.annotate(
+            author_full_name=Concat(
+                "creators__given_name", Value(" "), "creators__family_name"
+            )
+        ).filter(author_full_name=author_name)
+    publications = publications.distinct()
+
+    start_year = _year(start_value) if start_value else None
+    end_year = _year(end_value) if end_value else None
+    if start_year is None and end_year is None and not require_year:
+        return list(publications)
+
+    result = []
+    for publication in publications:
+        year = publication.year_published
+        if year is None:
+            continue
+        year = int(year)
+        if start_year is not None and year < start_year:
+            continue
+        if end_year is not None and year > end_year:
+            continue
+        result.append(publication)
+    return result
+
+
+def publication_ids_for_filters(filter_criteria):
+    return [publication.pk for publication in filtered_publications(filter_criteria)]
+
+
+class NetworkData:
     def __init__(self, nodes, links, filter_value):
         self.graph = {"links": links, "nodes": nodes}
         self.filter_value = filter_value
@@ -31,35 +72,15 @@ def generate_node_candidates(links_candidates):
 
 # Generates links that will be used to form the network based on the provided filter criteria
 def generate_link_candidates(filter_criteria):
-    start_year = 1901
-    end_year = 2100
-
-    if "date_published__gte" in filter_criteria:
-        start_year = datetime.strptime(
-            filter_criteria.pop("date_published__gte"), "%Y-%m-%dT%H:%M:%SZ"
-        ).year
-    if "date_published__lte" in filter_criteria:
-        end_year = datetime.strptime(
-            filter_criteria.pop("date_published__lte"), "%Y-%m-%dT%H:%M:%SZ"
-        ).year
-
-    # fetching only filtered publication
-    primary_publications = Publication.api.primary(**filter_criteria)
-
-    primary_pk = []
-    primary_pubs = []
-    for pub in primary_publications:
-        if (
-            pub.year_published is not None
-            and start_year <= pub.year_published <= end_year
-        ):
-            primary_pk.append(pub.pk)
-            primary_pubs.append(pub)
+    primary_pubs = filtered_publications(filter_criteria, require_year=True)
+    primary_pk = [publication.pk for publication in primary_pubs]
 
     # fetches links that satisfies the given filter
-    links_candidates = primary_publications.filter(
-        pk__in=primary_pk, citations__in=primary_pubs
-    ).values_list("pk", "citations")
+    links_candidates = (
+        Publication.api.primary()
+        .filter(pk__in=primary_pk, citations__in=primary_pubs)
+        .values_list("pk", "citations")
+    )
     return links_candidates
 
 
@@ -71,10 +92,11 @@ def get_network_default_filter(group_by):
 
 
 def generate_network_graph(filter_criteria, group_by=NetworkGroupByType.TAGS.value):
+    filter_criteria = dict(filter_criteria)
     if group_by + "__name__in" in filter_criteria:
-        filter_value = filter_criteria[group_by + "__name__in"]
+        filter_value = list(filter_criteria[group_by + "__name__in"])
     else:
-        filter_value = get_network_default_filter(group_by)
+        filter_value = list(get_network_default_filter(group_by))
         filter_criteria[group_by + "__name__in"] = filter_value
 
     # fetches links that satisfies the given filter
@@ -109,13 +131,11 @@ def get_nodes(nodes_candidates, filter_value, group_by):
     nodes = []
     for pub in nodes_candidates:
         publication = publications.get(pk=pub)
-        group_values = []
         if group_by == NetworkGroupByType.SPONSOR.value:
-            for name in publication.sponsors.all().values_list("name", flat=True):
-                group_values.append(name)
+            related = publication.sponsors
         else:
-            for name in publication.tags.all().values_list("name", flat=True):
-                group_values.append(name)
+            related = publication.tags
+        group_values = list(related.values_list("name", flat=True))
 
         value = get_common_value(group_values, filter_value)
         if value:
@@ -127,17 +147,11 @@ def get_nodes(nodes_candidates, filter_value, group_by):
             {
                 "name": pub,
                 "group": group,
-                "tags": ", ".join(
-                    ["{0}".format(s.name) for s in publication.tags.all()]
-                ),
-                "sponsors": ", ".join(
-                    ["{0}".format(s.name) for s in publication.sponsors.all()]
-                ),
+                "tags": ", ".join(s.name for s in publication.tags.all()),
+                "sponsors": ", ".join(s.name for s in publication.sponsors.all()),
                 "Authors": ", ".join(
-                    [
-                        "{0}, {1}.".format(c.family_name, c.given_name_initial)
-                        for c in publication.creators.all()
-                    ]
+                    f"{creator.family_name}, {creator.given_name_initial}."
+                    for creator in publication.creators.all()
                 ),
                 "title": publication.title,
             }
@@ -158,18 +172,14 @@ def get_common_value(first, second):
 
 
 def generate_aggregated_distribution_data(filter_criteria, classifier, name):
-    sqs = SearchQuerySet()
-    pubs = sqs.filter(**filter_criteria).models(Publication)
+    pubs = filtered_publications(filter_criteria)
     availability = Counter()
     non_availability = Counter()
     years_list = []
     if pubs:
         for pub in pubs:
             is_archived = pub.is_archived
-            try:
-                date_published = pub.date_published.year
-            except:
-                date_published = None
+            date_published = int(pub.year_published) if pub.year_published else None
             if date_published is not None:
                 years_list.append(date_published)
                 bucket = availability if is_archived else non_availability
@@ -194,45 +204,23 @@ def generate_aggregated_distribution_data(filter_criteria, classifier, name):
             )
 
         return distribution_data
+    return []
 
 
 def generate_aggregated_code_archived_platform_data(filter_criteria=None):
     if filter_criteria is None:
         filter_criteria = {}
-    url_logs = (
-        URLStatusLog.objects.all()
-        .values("publication")
-        .order_by("publication", "-last_modified")
-        .annotate(last_modified=Max("last_modified"))
-        .values("publication", "type")
-        .order_by("publication")
+    publication_ids = publication_ids_for_filters(filter_criteria)
+    counts = {
+        category: 0
+        for category in CodeArchiveUrlCategory.objects.order_by()
+        .values_list("category", flat=True)
+        .distinct()
+    }
+    rows = (
+        CodeArchiveUrl.api.active(publication_id__in=publication_ids)
+        .values("category__category")
+        .annotate(count=Count("publication_id", distinct=True))
     )
-
-    platform_dct = {}
-
-    if url_logs:
-        for platform_name in URLStatusLog.PLATFORM_TYPES:
-            platform_dct.update(
-                {platform_name[0]: url_logs.filter(type=platform_name[0]).count()}
-            )
-        return platform_dct
-    else:
-        sqs = SearchQuerySet()
-        sqs = sqs.filter(**filter_criteria).models(Publication)
-        filtered_pubs = queryset_gen(sqs)
-        pubs = Publication.api.primary(pk__in=filtered_pubs)
-        for platform_name in URLStatusLog.PLATFORM_TYPES:
-            platform_dct.update({platform_name[0]: 0})
-        for pub in pubs:
-            # FIXME: this needs to be updated to work with CodeArchiveUrls (or thrown away)
-            """
-            if pub.code_archive_url is not '':
-                platform_type = categorize_url(pub.code_archive_url)
-                platform_dct.update({platform_type: platform_dct[platform_type] + 1})
-            """
-        return platform_dct
-
-
-def queryset_gen(search_qs):
-    for item in search_qs:
-        yield item.pk
+    counts.update({row["category__category"]: row["count"] for row in rows})
+    return counts
